@@ -1,7 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import './App.css';
-import { db } from './firebase'; // 우리가 만든 파이어베이스 연결 케이블
-import { collection, doc, setDoc, updateDoc, deleteDoc, onSnapshot, getDoc } from "firebase/firestore";
+import './App.css'; // 작성해둔 CSS 불러오기
+import { db } from './firebase'; // 방금 만든 파이어베이스 창고 연결 파이프라인 불러오기
+import { collection, onSnapshot, doc, setDoc, updateDoc, deleteDoc } from 'firebase/firestore';
+
+const DEFAULT_ROOMS = [];
+const DEFAULT_DEV_RESERVATIONS = [];
+const DEV_UNAVAILABLE_DAYS = [];
 
 const getDaysInMonthArray = (year, month) => {
   const totalDays = new Date(year, month, 0).getDate();
@@ -16,12 +20,11 @@ const getMonthStartOffsetGap = (year, month) => {
 };
 
 function App() {
-  // 클라우드에서 가져올 데이터들 (초기값은 빈 배열)
   const [usersDatabase, setUsersDatabase] = useState([]);
   const [rooms, setRooms] = useState([]);
   const [devReservations, setDevReservations] = useState([]);
 
-  // 내 로그인 정보는 브라우저 껐다 켜도 유지되게 localStorage 사용
+  // 접속한 사람의 세션 정보는 각자 브라우저에 유지되어야 하므로 localStorage 유지
   const [currentUser, setCurrentUser] = useState(() => {
     try { return JSON.parse(localStorage.getItem('bmz_session_v15')) || null; } 
     catch(e) { return null; }
@@ -56,36 +59,9 @@ function App() {
   const [showNoticeModal, setShowNoticeModal] = useState(false);
   const [showUserList, setShowUserList] = useState(false);
 
-  // 개발자 여부 확인
   const isDeveloper = currentUser?.id === '개발자#4475';
 
-  // ★ Firebase 실시간 데이터 동기화 (새로고침 없이 실시간 반영!)
-  useEffect(() => {
-    // 1. 유저 정보 동기화
-    const unsubUsers = onSnapshot(collection(db, "users"), (snapshot) => {
-      setUsersDatabase(snapshot.docs.map(doc => doc.data()));
-    });
-    // 2. 모임 방 정보 동기화
-    const unsubRooms = onSnapshot(collection(db, "rooms"), (snapshot) => {
-      // 최신순 정렬을 위해 생성 시간(id) 기준으로 내림차순 정렬할 수도 있지만, 일단 그대로 반영
-      const roomsData = snapshot.docs.map(doc => doc.data());
-      // 모임 코드가 최신인 것을 위로 올리기 위해 간단히 정렬
-      roomsData.sort((a, b) => b.id.localeCompare(a.id)); 
-      setRooms(roomsData);
-    });
-    // 3. 개발자 식사 예약 정보 동기화
-    const unsubDev = onSnapshot(collection(db, "devReservations"), (snapshot) => {
-      setDevReservations(snapshot.docs.map(doc => doc.data()));
-    });
-
-    return () => {
-      unsubUsers();
-      unsubRooms();
-      unsubDev();
-    };
-  }, []);
-
-  // 로그인 상태 로컬에 저장
+  // ✨ [핵심 변경] 구글 클라우드 창고(Firestore)와 실시간 동기화 파이프라인 연결
   useEffect(() => {
     localStorage.setItem('bmz_session_v15', JSON.stringify(currentUser));
     if (view !== 'dashboard' && view !== 'dev-lunch-intro') {
@@ -93,12 +69,37 @@ function App() {
     }
   }, [currentUser, view]);
 
+  useEffect(() => {
+    // 1. 유저 리스트 실시간 동기화
+    const unsubscribeUsers = onSnapshot(collection(db, "users"), (snapshot) => {
+      const usersData = snapshot.docs.map(doc => doc.data());
+      setUsersDatabase(usersData);
+    });
+
+    // 2. 모임 방 리스트 실시간 동기화
+    const unsubscribeRooms = onSnapshot(collection(db, "rooms"), (snapshot) => {
+      const roomsData = snapshot.docs.map(doc => doc.data());
+      setRooms(roomsData);
+    });
+
+    // 3. 개발자 예약 리스트 실시간 동기화
+    const unsubscribeDevRes = onSnapshot(collection(db, "devReservations"), (snapshot) => {
+      const devResData = snapshot.docs.map(doc => doc.data());
+      setDevReservations(devResData);
+    });
+
+    return () => {
+      unsubscribeUsers();
+      unsubscribeRooms();
+      unsubscribeDevRes();
+    };
+  }, []);
+
   const triggerToast = (msg) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(''), 3000);
   };
 
-  // 파이어베이스에 사용자 로그인/등록
   const handleLogin = async (e) => {
     e.preventDefault();
     const trimName = loginName.trim();
@@ -110,8 +111,9 @@ function App() {
     }
 
     const userId = `${trimName}#${trimBirth}`;
-    let successMsg = `환영합니다, ${trimName}님!`;
+    const existingUser = usersDatabase.find(u => u.name === trimName);
     
+    let successMsg = `환영합니다, ${trimName}님!`;
     if (trimName === '개발자' && trimBirth === '4475') {
         successMsg = "개발자 마스터 계정으로 로그인되었습니다.";
     } else {
@@ -120,19 +122,16 @@ function App() {
         if (isBirthday) successMsg = `${trimName}님! 생일 축하합니다~!`;
     }
 
-    // 파이어베이스에서 유저 정보 확인
-    const userRef = doc(db, "users", userId);
-    const userSnap = await getDoc(userRef);
-
-    if (userSnap.exists()) {
-      if (userSnap.data().birth !== trimBirth) {
+    if (existingUser) {
+      if (existingUser.birth !== trimBirth) {
         triggerToast("입력하신 이름과 생일 정보가 다릅니다. 다시 확인해주세요.");
         return;
       }
       triggerToast(successMsg);
     } else {
-      // 새로운 유저 파이어베이스에 저장
-      await setDoc(userRef, { id: userId, name: trimName, birth: trimBirth });
+      // 새로운 멤버 구글 창고에 등록
+      const newUser = { id: userId, name: trimName, birth: trimBirth };
+      await setDoc(doc(db, "users", userId), newUser);
       triggerToast(successMsg + " (새로운 멤버 등록)");
     }
 
@@ -189,7 +188,6 @@ function App() {
     setView('select-dates');
   };
 
-  // 파이어베이스에 새로운 방 만들기
   const handleFinalizeRoom = async () => {
     if (selectedDates.length === 0) {
       triggerToast("식사를 희망하시는 날짜를 캘린더에서 최소 하나 선택하세요.");
@@ -208,10 +206,10 @@ function App() {
         { id: currentUser.id, name: currentUser.name, dates: selectedDates, comment: roomOpinion }
       ]
     };
-    
-    // 파이어베이스에 저장
+
+    // 구글 창고(Firestore)의 'rooms' 컬렉션에 업로드
     await setDoc(doc(db, "rooms", newCode), newRoom);
-    
+
     setCreatedRoomCode(newCode);
     setView('room-success');
     
@@ -220,7 +218,6 @@ function App() {
     setCreatorFirstOpinion('');
   };
 
-  // 파이어베이스에 있는 방에 코드로 입장하기
   const handleJoinRoomSubmit = async (e) => {
     e.preventDefault();
     const cleanJoinCode = joinCode.trim().replace(/-/g, '').toUpperCase();
@@ -239,7 +236,7 @@ function App() {
     
     if (!isAlreadyPart) {
       const updatedParticipants = [...targetRoom.participants, { id: currentUser.id, name: currentUser.name, dates: [], comment: "없음" }];
-      // 파이어베이스 방 정보 업데이트
+      // 구글 창고 데이터 실시간 업데이트
       await updateDoc(doc(db, "rooms", targetRoom.id), { participants: updatedParticipants });
     }
     
@@ -256,45 +253,49 @@ function App() {
     }
   };
 
-  // 파이어베이스 내 투표 일정 업데이트
   const handleGuestJoinSubmit = async (guestSelectedDates, opinionText) => {
     if (guestSelectedDates.length === 0) {
       triggerToast("참가할 날짜를 최소 하나 이상 선택해주세요.");
       return;
     }
     
-    const roomToUpdate = rooms.find(r => r.id === selectedRoomId);
-    if (roomToUpdate) {
-      const existingIndex = roomToUpdate.participants.findIndex(p => p.id === currentUser.id);
-      let updatedParticipants = [...roomToUpdate.participants];
-      const opinionComment = opinionText.trim() || "없음";
-      
-      if (existingIndex > -1) {
-        updatedParticipants[existingIndex] = { 
-          id: currentUser.id, name: currentUser.name, dates: guestSelectedDates, comment: opinionComment
-        };
-      } else {
-        updatedParticipants.push({ 
-          id: currentUser.id, name: currentUser.name, dates: guestSelectedDates, comment: opinionComment
-        });
-      }
-      // 파이어베이스 업데이트
-      await updateDoc(doc(db, "rooms", selectedRoomId), { participants: updatedParticipants });
-      triggerToast(`내 일정이 업데이트 되었습니다.`);
+    const targetRoom = rooms.find(r => r.id === selectedRoomId);
+    if (!targetRoom) return;
+
+    const existingIndex = targetRoom.participants.findIndex(p => p.id === currentUser.id);
+    let updatedParticipants = [...targetRoom.participants];
+    const opinionComment = opinionText.trim() || "없음";
+    
+    if (existingIndex > -1) {
+      updatedParticipants[existingIndex] = { 
+        id: currentUser.id,
+        name: currentUser.name, 
+        dates: guestSelectedDates,
+        comment: opinionComment
+      };
+    } else {
+      updatedParticipants.push({ 
+        id: currentUser.id,
+        name: currentUser.name, 
+        dates: guestSelectedDates,
+        comment: opinionComment
+      });
     }
+
+    // 구글 창고 데이터 실시간 업데이트
+    await updateDoc(doc(db, "rooms", selectedRoomId), { participants: updatedParticipants });
+    triggerToast(`내 일정이 업데이트 되었습니다.`);
   };
 
-  // 방에서 나가기 (내 일정 삭제)
   const handleLeaveRoom = async (roomId) => {
-    const roomToLeave = rooms.find(r => r.id === roomId);
-    if (roomToLeave) {
-      const updatedParticipants = roomToLeave.participants.filter(p => p.id !== currentUser.id);
-      await updateDoc(doc(db, "rooms", roomId), { participants: updatedParticipants });
-      triggerToast("내 대시보드에서 삭제되었습니다.");
-    }
+    const targetRoom = rooms.find(r => r.id === roomId);
+    if (!targetRoom) return;
+
+    const updatedParticipants = targetRoom.participants.filter(p => p.id !== currentUser.id);
+    await updateDoc(doc(db, "rooms", roomId), { participants: updatedParticipants });
+    triggerToast("내 대시보드에서 삭제되었습니다.");
   };
 
-  // 개발자 약속 신청
   const handleDevBookingSubmit = async (e) => {
     e.preventDefault();
     if (!devSelectedDate) {
@@ -308,19 +309,20 @@ function App() {
       return;
     }
 
+    const bookingId = 'dev-' + Date.now();
     const newBooking = {
-      id: 'dev-' + Date.now(),
+      id: bookingId,
       date: devSelectedDate,
       userId: currentUser.id,
       nickname: currentUser.name,
       birth: currentUser.birth
     };
 
-    await setDoc(doc(db, "devReservations", newBooking.id), newBooking);
+    // 개발자 예약 내역 구글 창고에 업로드
+    await setDoc(doc(db, "devReservations", bookingId), newBooking);
     triggerToast("예약되었습니다.");
   };
 
-  // 개발자 일정 블락
   const handleMasterBlockDate = async () => {
     if (!devSelectedDate) {
       triggerToast("차단할 일자를 달력에서 먼저 터치해 주십시오.");
@@ -332,8 +334,9 @@ function App() {
       return;
     }
     
+    const bookingId = 'dev-block-' + Date.now();
     const forceBlock = {
-      id: 'dev-block-' + Date.now(),
+      id: bookingId,
       date: devSelectedDate,
       userId: 'master-block',
       nickname: '개발자 휴무',
@@ -341,12 +344,13 @@ function App() {
       memo: devBlockMemo.trim() || '개인 일정으로 인한 불가'
     };
     
-    await setDoc(doc(db, "devReservations", forceBlock.id), forceBlock);
+    await setDoc(doc(db, "devReservations", bookingId), forceBlock);
     triggerToast("해당 일자가 차단(블락)되었습니다.");
     setDevBlockMemo('');
   };
 
   const handleCancelDevBooking = async (bookingId) => {
+    // 구글 창고에서 예약 도큐먼트 즉시 삭제
     await deleteDoc(doc(db, "devReservations", bookingId));
     triggerToast("해당 일정을 정상적으로 해제/취소 했습니다.");
   };
@@ -356,30 +360,27 @@ function App() {
     if (targetName) {
       const targetUser = usersDatabase.find(u => u.name === targetName);
       if (targetUser) {
-        // 1. 유저 삭제
+        // 1. 유저 데이터 삭제
         await deleteDoc(doc(db, "users", targetUser.id));
         
-        // 2. 방 목록에서 해당 유저가 방장이면 방 폭파, 참여자면 내보내기
-        for (let r of rooms) {
-          if (r.creatorId === targetUser.id) {
-            await deleteDoc(doc(db, "rooms", r.id));
-          } else {
-            const hasUser = r.participants.some(p => p.id === targetUser.id);
-            if (hasUser) {
-              const updatedP = r.participants.filter(p => p.id !== targetUser.id);
-              await updateDoc(doc(db, "rooms", r.id), { participants: updatedP });
-            }
+        // 2. 방 데이터 연쇄 삭제 및 업데이트
+        rooms.forEach(async (room) => {
+          if (room.creatorId === targetUser.id) {
+            await deleteDoc(doc(db, "rooms", room.id));
+          } else if (room.participants.some(p => p.id === targetUser.id)) {
+            const filteredParticipants = room.participants.filter(p => p.id !== targetUser.id);
+            await updateDoc(doc(db, "rooms", room.id), { participants: filteredParticipants });
           }
-        }
+        });
 
-        // 3. 개발자 예약 취소
-        for (let d of devReservations) {
-          if (d.userId === targetUser.id) {
-            await deleteDoc(doc(db, "devReservations", d.id));
+        // 3. 개발자 예약 연쇄 삭제
+        devReservations.forEach(async (res) => {
+          if (res.userId === targetUser.id) {
+            await deleteDoc(doc(db, "devReservations", res.id));
           }
-        }
+        });
 
-        triggerToast(`[${targetName}] 님의 모든 등록 정보가 클라우드에서 완전히 삭제되었습니다.`);
+        triggerToast(`[${targetName}] 님의 모든 등록 정보가 초기화되었습니다.`);
       } else {
         triggerToast("해당 이름의 멤버를 데이터베이스에서 찾을 수 없습니다.");
       }
@@ -443,7 +444,7 @@ function App() {
               <p>• <strong className="text-white">새로운 모임 개설:</strong> 새로운 모임을 만들고 코드를 공유하세요.</p>
               <p>• <strong className="text-white">코드로 입장:</strong> 전달받은 초대 코드로 약속에 합류하세요.</p>
               <p>• <strong className="text-white">개발자와의 1:1 식사:</strong> 개발자와의 식사 일정을 잡아보세요.</p>
-              <p className="text-[10px] text-neutral-500 pt-3 border-t border-neutral-800 text-center">*본 서비스는 사내 동료들과의 식사 약속을 위해 제작되었습니다. 비밀번호는 꼭 기억해주세요!</p>
+              <p className="text-[10px] text-neutral-500 pt-3 border-t border-neutral-800 text-center">*본 서비스는 비밀번호는 아무거나 넣어도 로그인이 되지만 번호를 꼭 기억해주세요! </p>
             </div>
             <button onClick={() => setShowNoticeModal(false)} className="w-full py-3 bg-neutral-900 border border-neutral-700 text-white text-[14px] font-bold hover:bg-neutral-800 transition">닫기</button>
           </div>
@@ -467,7 +468,7 @@ function App() {
               <button onClick={async () => { 
                   if (isCreatorDelete) {
                     await deleteDoc(doc(db, "rooms", confirmDeleteRoomId));
-                    triggerToast("일정이 서버에서 삭제되었습니다.");
+                    triggerToast("일정이 완전히 삭제되었습니다.");
                   } else {
                     await handleLeaveRoom(confirmDeleteRoomId); 
                   }
@@ -1383,4 +1384,4 @@ function App() {
   );
 }
 
-export default App;   
+export default App;
