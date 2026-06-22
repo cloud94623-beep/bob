@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import './App.css';
-// import { db } from './firebase'; // 향후 Firebase DB 연동 시 주석 해제
+import { db } from './firebase';
+import { collection, onSnapshot, doc, setDoc, deleteDoc } from "firebase/firestore";
 
 // SVG 컴포넌트 모음
 const SunSVG = () => (
@@ -28,12 +29,6 @@ const getDaysInMonthArray = (year, month) => {
 };
 const getMonthStartOffsetGap = (year, month) => new Date(year, month - 1, 1).getDay();
 
-const safeParseArray = (key) => {
-  try {
-    const data = JSON.parse(localStorage.getItem(key));
-    return Array.isArray(data) ? data : [];
-  } catch(e) { return []; }
-};
 const safeParseObj = (key) => {
   try {
     return JSON.parse(localStorage.getItem(key)) || null;
@@ -41,13 +36,15 @@ const safeParseObj = (key) => {
 };
 
 export default function App() {
-  const [usersDatabase, setUsersDatabase] = useState(() => safeParseArray('bmz_users_v24'));
+  // 🚀 글로벌 공유 데이터 (Firestore에서 실시간으로 가져옴)
+  const [usersDatabase, setUsersDatabase] = useState([]);
+  const [rooms, setRooms] = useState([]);
+  const [mySchedules, setMySchedules] = useState([]);
+  const [devReservations, setDevReservations] = useState([]);
+
   const [currentUser, setCurrentUser] = useState(() => safeParseObj('bmz_session_v24'));
-  const [rooms, setRooms] = useState(() => safeParseArray('bmz_rooms_v24'));
-  const [mySchedules, setMySchedules] = useState(() => safeParseArray('bmz_schedules_v24')); 
-  const [devReservations, setDevReservations] = useState(() => safeParseArray('bmz_dev_v24'));
-  
   const [view, setView] = useState(currentUser ? 'dashboard' : 'login');
+  
   const [loginName, setLoginName] = useState('');
   const [loginBirth, setLoginBirth] = useState('');
 
@@ -82,21 +79,78 @@ export default function App() {
 
   const isDeveloper = currentUser?.id === '개발자#4475';
 
+  // 내 로그인 정보는 로컬에 유지
   useEffect(() => {
-    try {
-      localStorage.setItem('bmz_users_v24', JSON.stringify(usersDatabase));
+    if (currentUser) {
       localStorage.setItem('bmz_session_v24', JSON.stringify(currentUser));
-      localStorage.setItem('bmz_rooms_v24', JSON.stringify(rooms));
-      localStorage.setItem('bmz_schedules_v24', JSON.stringify(mySchedules));
-      localStorage.setItem('bmz_dev_v24', JSON.stringify(devReservations));
-    } catch (e) {
-      console.warn("Storage warning");
+    } else {
+      localStorage.removeItem('bmz_session_v24');
     }
-  }, [usersDatabase, currentUser, rooms, mySchedules, devReservations]);
+  }, [currentUser]);
 
   const triggerToast = (msg) => {
     setToastMessage(msg);
-    setTimeout(() => setToastMessage(''), 3000);
+    setTimeout(() => setToastMessage(''), 4000);
+  };
+
+  // 🚀 파이어베이스 실시간 수신 (무한 로딩 방지 및 에러 팝업 추가)
+  useEffect(() => {
+    // 1. 사용자 컬렉션
+    const unsubUsers = onSnapshot(collection(db, "users"), (snapshot) => {
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setUsersDatabase(data);
+    }, (error) => {
+      console.error("Users 에러:", error);
+      triggerToast("Users 데이터 로드 실패: " + error.code);
+    });
+
+    // 2. 방(Rooms) 컬렉션
+    const unsubRooms = onSnapshot(collection(db, "rooms"), (snapshot) => {
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setRooms(data);
+    }, (error) => {
+      console.error("Rooms 에러:", error);
+      triggerToast("Rooms 데이터 로드 실패: " + error.code);
+    });
+
+    // 3. 내 일정(Schedules) 컬렉션
+    const unsubSchedules = onSnapshot(collection(db, "schedules"), (snapshot) => {
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setMySchedules(data);
+    }, (error) => {
+      console.error("Schedules 에러:", error);
+      triggerToast("일정 데이터 로드 실패: " + error.code);
+    });
+
+    // 4. 개발자 예약(dev예약) 컬렉션
+    const unsubDev = onSnapshot(collection(db, "devReservations"), (snapshot) => {
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setDevReservations(data);
+    }, (error) => {
+      console.error("DevReservations 에러:", error);
+      triggerToast("예약 데이터 로드 실패: " + error.code);
+    });
+
+    return () => { unsubUsers(); unsubRooms(); unsubSchedules(); unsubDev(); };
+  }, []);
+
+  // 🚀 Firestore 데이터 저장/업데이트/삭제 도우미 함수 (에러 상세 표시)
+  const saveToDb = async (collectionName, docId, data) => {
+    try {
+      await setDoc(doc(db, collectionName, docId), data);
+    } catch (e) {
+      console.error("Error saving document: ", e);
+      triggerToast(`저장 실패 (${collectionName}): ` + e.code);
+    }
+  };
+
+  const deleteFromDb = async (collectionName, docId) => {
+    try {
+      await deleteDoc(doc(db, collectionName, docId));
+    } catch (e) {
+      console.error("Error deleting document: ", e);
+      triggerToast(`삭제 실패 (${collectionName}): ` + e.code);
+    }
   };
 
   const handleLogin = (e) => {
@@ -113,7 +167,8 @@ export default function App() {
     }
 
     if (!existingUser) {
-      setUsersDatabase([...usersDatabase, { id: userId, name: trimName, birth: trimBirth }]);
+      // 신규 유저 DB 저장 (users 컬렉션)
+      saveToDb("users", userId, { id: userId, name: trimName, birth: trimBirth });
     }
     setCurrentUser({ id: userId, name: trimName, birth: trimBirth });
     setView('dashboard');
@@ -142,7 +197,9 @@ export default function App() {
       creatorId: currentUser.id, dates: selectedDates, fixedDate: null,
       participants: [{ id: currentUser.id, name: currentUser.name, dates: selectedDates, comment: creatorInitialOpinion || "없음" }]
     };
-    setRooms([newRoom, ...rooms]);
+    
+    saveToDb("rooms", newCode, newRoom); // DB 저장
+    
     setCreatedRoomCode(newCode);
     setView('room-success');
     setNewRoomTitle(''); setCreatorFirstOpinion('');
@@ -162,8 +219,8 @@ export default function App() {
     if (!targetRoom) return triggerToast("존재하지 않는 코드입니다.");
     
     if (!targetRoom.participants.some(p => p.id === currentUser.id)) {
-      const updatedRooms = rooms.map(r => r.id === targetRoom.id ? { ...r, participants: [...r.participants, { id: currentUser.id, name: currentUser.name, dates: [], comment: "없음" }] } : r);
-      setRooms(updatedRooms);
+      const updatedParticipants = [...targetRoom.participants, { id: currentUser.id, name: currentUser.name, dates: [], comment: "없음" }];
+      saveToDb("rooms", targetRoom.id, { ...targetRoom, participants: updatedParticipants }); // DB 업데이트
       setInputSelectedDates([]); 
     } else {
         setInputSelectedDates(targetRoom.participants.find(p => p.id === currentUser.id)?.dates || []);
@@ -177,52 +234,55 @@ export default function App() {
 
   const handleGuestJoinSubmit = () => {
     if ((inputSelectedDates || []).length === 0) return triggerToast("날짜를 선택해주세요.");
-    const updatedRooms = rooms.map(r => {
-      if (r.id === selectedRoomId) {
-        const existingIdx = r.participants.findIndex(p => p.id === currentUser.id);
-        let newParts = [...r.participants];
-        if (existingIdx > -1) newParts[existingIdx] = { ...newParts[existingIdx], dates: inputSelectedDates || [], comment: guestOpinion || "없음" };
-        else newParts.push({ id: currentUser.id, name: currentUser.name, dates: inputSelectedDates || [], comment: guestOpinion || "없음" });
-        return { ...r, participants: newParts };
-      }
-      return r;
-    });
-    setRooms(updatedRooms);
+    
+    const targetRoom = rooms.find(r => r.id === selectedRoomId);
+    if(targetRoom) {
+      const existingIdx = targetRoom.participants.findIndex(p => p.id === currentUser.id);
+      let newParts = [...targetRoom.participants];
+      if (existingIdx > -1) newParts[existingIdx] = { ...newParts[existingIdx], dates: inputSelectedDates || [], comment: guestOpinion || "없음" };
+      else newParts.push({ id: currentUser.id, name: currentUser.name, dates: inputSelectedDates || [], comment: guestOpinion || "없음" });
+      
+      saveToDb("rooms", targetRoom.id, { ...targetRoom, participants: newParts }); // DB 업데이트
+    }
+    
     setGuestOpinion('');
     triggerToast("내 일정이 업데이트 되었습니다.");
   };
 
   const handleFixSchedule = (dateStr) => {
-    setRooms(rooms.map(r => r.id === selectedRoomId ? { ...r, fixedDate: dateStr } : r));
+    const targetRoom = rooms.find(r => r.id === selectedRoomId);
+    saveToDb("rooms", targetRoom.id, { ...targetRoom, fixedDate: dateStr });
     triggerToast(`[${dateStr}] 일정이 최종 확정되었습니다!`);
   };
 
   const handleCancelFix = () => {
-    setRooms(rooms.map(r => r.id === selectedRoomId ? { ...r, fixedDate: null } : r));
+    const targetRoom = rooms.find(r => r.id === selectedRoomId);
+    saveToDb("rooms", targetRoom.id, { ...targetRoom, fixedDate: null });
     triggerToast("일정 확정이 취소되었습니다.");
   };
 
   const handleAddPersonalSchedule = () => {
     if (!myCalSelectedDate) return triggerToast("날짜를 먼저 선택하세요.");
     const memoText = myCalMemo.trim() || "개인 일정";
-    setMySchedules([...mySchedules, { id: Date.now().toString(), userId: currentUser.id, date: myCalSelectedDate, timeType: myCalTimeType, text: memoText }]);
+    const newScheduleId = Date.now().toString();
+    const newSchedule = { id: newScheduleId, userId: currentUser.id, date: myCalSelectedDate, timeType: myCalTimeType, text: memoText };
+    
+    saveToDb("schedules", newScheduleId, newSchedule);
     setMyCalMemo('');
     triggerToast("내 일정에 추가되었습니다.");
   };
   
   const handleLeaveRoom = (roomId) => {
-    const updatedRooms = rooms.map(room => {
-      if (room.id === roomId) {
-        return { ...room, participants: room.participants.filter(p => p.id !== currentUser.id) };
-      }
-      return room;
-    });
-    setRooms(updatedRooms);
-    triggerToast("목록에서 삭제되었습니다.");
+    const targetRoom = rooms.find(r => r.id === roomId);
+    if(targetRoom) {
+      const filteredParts = targetRoom.participants.filter(p => p.id !== currentUser.id);
+      saveToDb("rooms", targetRoom.id, { ...targetRoom, participants: filteredParts });
+      triggerToast("목록에서 삭제되었습니다.");
+    }
   };
 
   const handleDeleteRoomCompletely = (roomId) => {
-    setRooms(rooms.filter(room => room.id !== roomId));
+    deleteFromDb("rooms", roomId);
     triggerToast("모임이 완전히 삭제되었습니다.");
   };
 
@@ -230,8 +290,10 @@ export default function App() {
     if (!devSelectedDate) return triggerToast("예약 일정을 선택하세요.");
     if (devReservations.some(res => res.date === devSelectedDate)) return triggerToast("이 날짜는 이미 선약이 있습니다.");
 
-    const newBooking = { id: 'dev-' + Date.now(), date: devSelectedDate, timeType, userId: currentUser.id, nickname: currentUser.name, birth: currentUser.birth };
-    setDevReservations([...devReservations, newBooking]);
+    const newBookingId = 'dev-' + Date.now();
+    const newBooking = { id: newBookingId, date: devSelectedDate, timeType, userId: currentUser.id, nickname: currentUser.name, birth: currentUser.birth };
+    
+    saveToDb("devReservations", newBookingId, newBooking);
     triggerToast("예약되었습니다.");
   };
 
@@ -239,23 +301,52 @@ export default function App() {
     if (!devSelectedDate) return triggerToast("차단할 일자를 선택하세요.");
     if (devReservations.some(res => res.date === devSelectedDate)) return triggerToast("이미 일정이 있습니다.");
     
-    const forceBlock = { id: 'dev-block-' + Date.now(), date: devSelectedDate, timeType, userId: 'master-block', nickname: '개발자 휴무', birth: '4475', memo: devBlockMemo.trim() || '개인 일정' };
-    setDevReservations([...devReservations, forceBlock]);
+    const forceBlockId = 'dev-block-' + Date.now();
+    const forceBlock = { id: forceBlockId, date: devSelectedDate, timeType, userId: 'master-block', nickname: '개발자 휴무', birth: '4475', memo: devBlockMemo.trim() || '개인 일정' };
+    
+    saveToDb("devReservations", forceBlockId, forceBlock);
     triggerToast("해당 날짜가 차단되었습니다.");
     setDevBlockMemo('');
   };
+  
+  const handleDeleteDevReservation = (bookingId) => {
+      deleteFromDb("devReservations", bookingId);
+      triggerToast("예약/차단이 취소되었습니다.");
+  };
+
+  const handleDeletePersonalSchedule = (scheduleId) => {
+      deleteFromDb("schedules", scheduleId);
+      triggerToast("개인 일정이 취소되었습니다.");
+  }
 
   const handleDeleteMemberCompletely = () => {
     const targetName = prompt("초기화할 멤버의 '이름'을 정확히 입력하세요.");
     if (targetName) {
       const targetUser = usersDatabase.find(u => u.name === targetName);
       if (targetUser) {
-        setUsersDatabase(prev => prev.filter(u => u.id !== targetUser.id));
-        setRooms(prev => {
-          const filteredRooms = prev.filter(r => r.creatorId !== targetUser.id);
-          return filteredRooms.map(r => ({ ...r, participants: r.participants.filter(p => p.id !== targetUser.id) }));
+        // 1. 사용자 삭제
+        deleteFromDb("users", targetUser.id);
+        
+        // 2. 해당 유저가 만든 방 삭제 또는 참여한 방에서 내보내기
+        rooms.forEach(r => {
+            if(r.creatorId === targetUser.id) {
+                deleteFromDb("rooms", r.id);
+            } else if(r.participants.some(p => p.id === targetUser.id)) {
+                const filteredParts = r.participants.filter(p => p.id !== targetUser.id);
+                saveToDb("rooms", r.id, { ...r, participants: filteredParts });
+            }
         });
-        setDevReservations(prev => prev.filter(r => r.userId !== targetUser.id));
+
+        // 3. dev예약 삭제
+        devReservations.forEach(r => {
+            if(r.userId === targetUser.id) deleteFromDb("devReservations", r.id);
+        });
+        
+        // 4. 내일정 삭제
+        mySchedules.forEach(s => {
+            if(s.userId === targetUser.id) deleteFromDb("schedules", s.id);
+        });
+
         triggerToast(`[${targetName}] 님의 모든 정보가 초기화되었습니다.`);
       } else triggerToast("해당 이름의 멤버를 찾을 수 없습니다.");
     }
@@ -331,7 +422,6 @@ export default function App() {
         </div>
       )}
       
-      {/* 🚀 1. 방장 삭제 권한 톤다운 완벽 적용 (실버/메탈 그레이/화이트로만 구성) */}
       {confirmDeleteRoomId && (() => {
         const roomToDelete = rooms.find(r => r.id === confirmDeleteRoomId);
         if (!roomToDelete) return null;
@@ -470,7 +560,6 @@ export default function App() {
               </button>
             </div>
 
-            {/* 🚀 2. 개발자 제어판 타이틀도 흰색 통일 */}
             {isDeveloper && (
               <div className="card-bg p-6 mt-6 border-neutral-800">
                 <h3 className="text-[12px] font-bold text-white tracking-widest uppercase mb-4 text-center">개발자 전용 제어판</h3>
@@ -571,7 +660,6 @@ export default function App() {
                 <span className="text-[14px] text-white font-bold">{myCalSelectedDate && myCalSelectedDate.includes('-') ? `${parseInt(myCalSelectedDate.split('-')[1])}월 ${parseInt(myCalSelectedDate.split('-')[2])}일` : ''}</span>
               </div>
 
-              {/* 🚀 3. 리스트 안의 모든 삭제/취소 버튼들을 메탈릭 톤으로 변경 */}
               {myCalSelectedDate ? (
                 <div className="space-y-4">
                   <div className="space-y-2">
@@ -603,7 +691,7 @@ export default function App() {
                           </span>
                           <span className="text-[13px] text-neutral-500 font-bold">{r.memo}</span>
                         </div>
-                        <button onClick={() => setDevReservations(devReservations.filter(res => res.id !== r.id))} className="text-[11px] text-neutral-400 border border-neutral-700 px-3 py-1 rounded-full font-bold hover:text-white hover:border-neutral-500 transition">해제</button>
+                        <button onClick={() => handleDeleteDevReservation(r.id)} className="text-[11px] text-neutral-400 border border-neutral-700 px-3 py-1 rounded-full font-bold hover:text-white hover:border-neutral-500 transition">해제</button>
                       </div>
                     ))}
                     {myPersonalEvents.filter(e => e.date === myCalSelectedDate).map(e => (
@@ -614,7 +702,7 @@ export default function App() {
                           </span>
                           <span className="text-[13px] text-white font-bold">{e.text}</span>
                         </div>
-                        <button onClick={() => setMySchedules(mySchedules.filter(s => s.id !== e.id))} className="text-[11px] text-neutral-400 border border-neutral-700 px-3 py-1 rounded-full font-bold hover:text-white hover:border-neutral-500 transition">취소하기</button>
+                        <button onClick={() => handleDeletePersonalSchedule(e.id)} className="text-[11px] text-neutral-400 border border-neutral-700 px-3 py-1 rounded-full font-bold hover:text-white hover:border-neutral-500 transition">취소하기</button>
                       </div>
                     ))}
                   </div>
@@ -989,7 +1077,6 @@ export default function App() {
                     <button onClick={() => setDevSelectedDate(dateStr)} className={btnClass}>
                       <span className={textColor}>{idx + 1}</span>
                     </button>
-                    {/* 🚀 일반 유저에게는 점조차 보이지 않게 아예 렌더링 제거 (프라이버시 보호) */}
                     {(isDeveloper || isMyBooking) && matchedBooking && !isSelected && (
                        <div className="absolute -bottom-1.5 w-full flex justify-center gap-[3px] pointer-events-none">
                           <span className={`w-[5px] h-[5px] rounded-full ${matchedBooking.timeType === 'lunch' ? 'gold-micro-dot' : 'silver-micro-dot'}`}></span>
@@ -1045,7 +1132,7 @@ export default function App() {
                               <div className={`p-2 rounded-full transition ${booking.timeType === 'dinner' ? 'bg-white text-black shadow-md' : 'text-neutral-500'}`}><MoonSVG /></div>
                             </div>
                             <div className="text-[13px] text-neutral-400 font-bold flex-1 px-2">차단됨: {booking.memo}</div>
-                            <button onClick={() => { setDevReservations(devReservations.filter(r => r.id !== booking.id)); triggerToast("블락 해제"); }} className="text-[11px] text-neutral-400 border border-neutral-700 bg-neutral-900 px-3 py-2 rounded-full font-bold hover:bg-neutral-800 hover:text-white transition">해제하기</button>
+                            <button onClick={() => handleDeleteDevReservation(booking.id)} className="text-[11px] text-neutral-400 border border-neutral-700 bg-neutral-900 px-3 py-2 rounded-full font-bold hover:bg-neutral-800 hover:text-white transition">해제하기</button>
                         </div>
                       );
                     } else {
@@ -1056,12 +1143,11 @@ export default function App() {
                               <div className={`p-2 rounded-full transition ${booking.timeType === 'dinner' ? 'bg-white text-black shadow-md' : 'text-neutral-500'}`}><MoonSVG /></div>
                             </div>
                             <div className="text-[13px] text-neutral-300 font-bold flex-1 px-2">예약자: {booking.nickname} 님</div>
-                            <button onClick={() => { setDevReservations(devReservations.filter(r => r.id !== booking.id)); triggerToast("취소 처리됨"); }} className="text-[11px] text-neutral-400 border border-neutral-700 px-3 py-2 rounded-full font-bold hover:text-white hover:border-neutral-500 transition">강제 취소</button>
+                            <button onClick={() => handleDeleteDevReservation(booking.id)} className="text-[11px] text-neutral-400 border border-neutral-700 px-3 py-2 rounded-full font-bold hover:text-white hover:border-neutral-500 transition">강제 취소</button>
                         </div>
                       );
                     }
                   } else {
-                    // 🚀 일반 유저가 타인의 선약이나 개발자 차단일을 볼 때 (점심/저녁 아이콘도 비활성화)
                     if (isAutoBlocked || (booking && booking.userId !== currentUser.id)) {
                       return (
                         <div className="flex items-center gap-3 pt-3 border-t border-neutral-800 mt-2">
@@ -1085,7 +1171,7 @@ export default function App() {
                                 <MoonSVG />
                               </button>
                             </div>
-                            <input type="text" value={guestOpinion} disabled placeholder="개발자와의 식사" className="premium-input text-[13px] py-3 flex-1 px-4 opacity-50" />
+                            <input type="text" value={guestOpinion} disabled placeholder="메모" className="premium-input text-[13px] py-3 flex-1 px-4 opacity-50" />
                             <button onClick={() => handleDevBookingSubmit(devTimeType)} className="bg-white text-black px-4 py-3 rounded-full font-bold text-[13px] shrink-0 hover:bg-neutral-200 transition">추가</button>
                         </div>
                       );
@@ -1097,7 +1183,7 @@ export default function App() {
                               <div className={`p-2 rounded-full transition ${booking.timeType === 'dinner' ? 'bg-white text-black shadow-md' : 'text-neutral-500'}`}><MoonSVG /></div>
                             </div>
                             <div className="text-[13px] text-white font-bold flex-1 px-2">내 예약 관리</div>
-                            <button onClick={() => { setDevReservations(devReservations.filter(r => r.id !== booking.id)); triggerToast("취소되었습니다."); }} className="text-[11px] text-neutral-400 border border-neutral-700 px-3 py-2 rounded-full font-bold hover:bg-neutral-800 hover:text-white transition">취소하기</button>
+                            <button onClick={() => handleDeleteDevReservation(booking.id)} className="text-[11px] text-neutral-400 border border-neutral-700 px-3 py-2 rounded-full font-bold hover:bg-neutral-800 hover:text-white transition">취소하기</button>
                         </div>
                       );
                     }
